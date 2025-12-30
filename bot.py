@@ -5,6 +5,7 @@ from datetime import datetime, time, timedelta
 import pytz
 import json
 from dotenv import load_dotenv
+from groq import Groq
 from scraper import (
     scrape_all_sources,
     scrape_bleeping_computer,
@@ -17,11 +18,15 @@ from scraper import (
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Initialize Groq client
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Global settings
 USER_ID = 'YOUR_USER_ID_HERE'  # Replace with your Discord user ID
@@ -39,7 +44,7 @@ default_settings = {
     'sent_articles': {},
     'notification_times': ['08:00', '15:15'],
     'weekly_articles': [],
-    'notify_user': True  # Whether to tag user on notifications
+    'notify_user': True
 }
 
 def load_settings():
@@ -92,6 +97,56 @@ def filter_articles(articles):
         if is_article_new(article['link']) and matches_keywords(article, settings['user_keywords']):
             filtered.append(article)
     return filtered
+
+def get_ai_summary(articles, max_articles=10):
+    """Generate AI summary of articles using Groq"""
+    if not groq_client:
+        return "Error: Groq API key not configured. Add GROQ_API_KEY to your .env file."
+    
+    if not articles:
+        return "No articles to summarize."
+    
+    # Limit to top articles
+    articles = articles[:max_articles]
+    
+    # Format articles for AI
+    articles_text = "\n\n".join([
+        f"Article {i+1}:\nTitle: {a['title']}\nSource: {a['source']}\nDescription: {a['description']}"
+        for i, a in enumerate(articles)
+    ])
+    
+    # Create prompt
+    prompt = f"""You are a cybersecurity expert. Below are today's top cybersecurity news articles. 
+
+Provide a concise executive summary that:
+1. Highlights the most critical security threats or developments
+2. Identifies common themes or trends
+3. Notes any urgent action items for security professionals
+4. Keep it under 500 words
+
+Articles:
+{articles_text}
+
+Executive Summary:"""
+    
+    try:
+        # Call Groq API
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            model="llama-3.1-8b-instant",
+            temperature=0.3,
+            max_tokens=1000
+        )
+        
+        return chat_completion.choices[0].message.content
+    
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
 
 @bot.event
 async def on_ready():
@@ -173,7 +228,7 @@ async def get_darknet(ctx):
     
     for episode in episodes:
         embed = discord.Embed(
-            title=f"🎙️ {episode['title']}",
+            title=f"{episode['title']}",
             url=episode['link'],
             description=episode['description'],
             color=0x1DB954
@@ -252,6 +307,44 @@ async def show_keywords(ctx):
     else:
         await ctx.send('No keyword filters active. All news will be shown.')
 
+@bot.command(name='ai_summary')
+async def ai_summary(ctx, num_articles: int = 10):
+    """
+    Generate AI summary of top cybersecurity news
+    Usage: !ai_summary [number_of_articles]
+    Example: !ai_summary 15
+    """
+    if not groq_client:
+        await ctx.send('AI summary is not configured. Please add GROQ_API_KEY to your .env file.')
+        return
+    
+    await ctx.send(f'Analyzing top {num_articles} cybersecurity articles...')
+    
+    # Scrape all sources
+    articles = scrape_all_sources()
+    
+    if not articles:
+        await ctx.send('Could not fetch any articles right now. Try again later.')
+        return
+    
+    # Generate summary
+    summary = get_ai_summary(articles, max_articles=num_articles)
+    
+    # Split into chunks if too long (Discord has 2000 char limit)
+    if len(summary) > 1900:
+        chunks = [summary[i:i+1900] for i in range(0, len(summary), 1900)]
+        await ctx.send('**AI-Generated Cybersecurity Summary:**')
+        for chunk in chunks:
+            await ctx.send(chunk)
+    else:
+        embed = discord.Embed(
+            title="AI-Generated Cybersecurity Summary",
+            description=summary,
+            color=0x00FF00
+        )
+        embed.set_footer(text=f"Analyzed {len(articles[:num_articles])} articles | Powered by Groq")
+        await ctx.send(embed=embed)
+
 @bot.command(name='notify_me')
 async def toggle_notifications(ctx):
     """Toggle whether you get tagged (@mentioned) on scheduled notifications"""
@@ -283,7 +376,7 @@ async def set_notification_times(ctx, time1: str, time2: str = None):
         save_settings(settings)
         
         times_str = ' and '.join(times)
-        await ctx.send(f' Notification times set to: {times_str} (Central Time)')
+        await ctx.send(f'Notification times set to: {times_str} (Central Time)')
     except ValueError:
         await ctx.send('Invalid time format. Use HH:MM (24-hour format)\nExample: !set_times 09:00 17:30')
 
@@ -300,7 +393,7 @@ async def show_stats(ctx):
     embed.add_field(name="Articles Tracked (24h)", value=str(total_tracked), inline=True)
     embed.add_field(name="Active Keywords", value=str(keywords), inline=True)
     embed.add_field(name="Notification Times", value=', '.join(settings['notification_times']), inline=False)
-    embed.add_field(name="Tag on Notify", value="Yes" if settings['notify_user'] else "🔕 No", inline=True)
+    embed.add_field(name="Tag on Notify", value="Yes" if settings['notify_user'] else "No", inline=True)
     
     if settings['user_keywords']:
         embed.add_field(name="Keywords", value=', '.join(settings['user_keywords']), inline=False)
@@ -310,151 +403,163 @@ async def show_stats(ctx):
 @tasks.loop(hours=6)
 async def check_darknet_diaries():
     """Check for new Darknet Diaries episodes every 6 hours"""
-    if settings['darknet_channel_id'] is None:
-        return
-    
-    print("Checking for new Darknet Diaries episodes...")
-    episodes = scrape_with_retry(scrape_darknet_diaries)
-    
-    if not episodes:
-        return
-    
-    latest_episode = episodes[0]
-    
-    if settings['last_episode_title'] is None:
-        settings['last_episode_title'] = latest_episode['title']
-        save_settings(settings)
-        return
-    
-    if latest_episode['title'] != settings['last_episode_title']:
-        print(f"New episode detected: {latest_episode['title']}")
-        settings['last_episode_title'] = latest_episode['title']
-        save_settings(settings)
+    try:
+        if settings['darknet_channel_id'] is None:
+            return
         
-        channel = bot.get_channel(settings['darknet_channel_id'])
-        if channel:
-            embed = discord.Embed(
-                title=f"NEW DARKNET DIARIES EPISODE!",
-                description=f"**{latest_episode['title']}**",
-                url=latest_episode['link'],
-                color=0xFF0000
-            )
-            embed.add_field(
-                name="Description",
-                value=latest_episode['description'],
-                inline=False
-            )
-            if latest_episode.get('date'):
-                embed.add_field(name="Released", value=latest_episode['date'], inline=True)
-            embed.set_footer(text="Darknet Diaries by Jack Rhysider")
+        print("Checking for new Darknet Diaries episodes...")
+        episodes = scrape_with_retry(scrape_darknet_diaries)
+        
+        if not episodes:
+            return
+        
+        latest_episode = episodes[0]
+        
+        if settings['last_episode_title'] is None:
+            settings['last_episode_title'] = latest_episode['title']
+            save_settings(settings)
+            return
+        
+        if latest_episode['title'] != settings['last_episode_title']:
+            print(f"New episode detected: {latest_episode['title']}")
+            settings['last_episode_title'] = latest_episode['title']
+            save_settings(settings)
             
-            if settings['notify_user']:
-                await channel.send(f"<@{USER_ID}>")
-            await channel.send(embed=embed)
+            channel = bot.get_channel(settings['darknet_channel_id'])
+            if channel:
+                embed = discord.Embed(
+                    title=f"NEW DARKNET DIARIES EPISODE!",
+                    description=f"**{latest_episode['title']}**",
+                    url=latest_episode['link'],
+                    color=0xFF0000
+                )
+                embed.add_field(
+                    name="Description",
+                    value=latest_episode['description'],
+                    inline=False
+                )
+                if latest_episode.get('date'):
+                    embed.add_field(name="Released", value=latest_episode['date'], inline=True)
+                embed.set_footer(text="Darknet Diaries by Jack Rhysider")
+                
+                if settings['notify_user']:
+                    await channel.send(f"<@{USER_ID}>")
+                await channel.send(embed=embed)
+    
+    except Exception as e:
+        print(f"Error in check_darknet_diaries: {e}")
 
 @tasks.loop(minutes=1)
 async def daily_news_digest():
     """Send daily news digest at configured times"""
-    if settings['daily_news_channel_id'] is None:
-        return
-    
-    now = datetime.now(user_timezone)
-    current_time = now.strftime('%H:%M')
-    
-    # Check if current time matches any notification time
-    if current_time in settings['notification_times']:
-        print(f"Sending daily news digest at {current_time}")
-        channel = bot.get_channel(settings['daily_news_channel_id'])
-        
-        if channel:
-            # Tag user if enabled
-            if settings['notify_user']:
-                await channel.send(f'<@{USER_ID}>**Daily Cybersecurity News Digest**')
-            else:
-                await channel.send(f'**Daily Cybersecurity News Digest**')
-            
-            sources = [
-                ('Bleeping Computer', scrape_bleeping_computer, 0xFF6B6B),
-                ('WIRED', scrape_wired_security, 0x000000),
-                ('Ars Technica', scrape_ars_technica_security, 0xFF4F00),
-                ('Krebs on Security', scrape_krebs_security, 0x0066CC)
-            ]
-            
-            total_articles = 0
-            
-            for source_name, scraper_func, color in sources:
-                articles = scrape_with_retry(scraper_func)
-                
-                if articles:
-                    # Filter and get first new article
-                    filtered = filter_articles(articles)
-                    
-                    if filtered:
-                        article = filtered[0]
-                        embed = discord.Embed(
-                            title=article['title'],
-                            url=article['link'],
-                            description=article['description'],
-                            color=color
-                        )
-                        embed.set_footer(text=f"Source: {article['source']}")
-                        await channel.send(embed=embed)
-                        total_articles += 1
-                        
-                        # Store for weekly summary
-                        settings['weekly_articles'].append({
-                            'article': article,
-                            'timestamp': datetime.now().isoformat()
-                        })
-                    else:
-                        await channel.send(f'{source_name}: No new articles matching your filters')
-                else:
-                    await channel.send(f'Could not fetch from {source_name}')
-            
-            save_settings(settings)
-            await channel.send(f'Daily digest complete! {total_articles} articles delivered.')
-
-@tasks.loop(hours=24)
-async def weekly_summary():
-    """Send weekly summary every Sunday"""
-    now = datetime.now(user_timezone)
-    
-    # Check if it's Sunday at 10:00 AM
-    if now.weekday() == 6 and now.hour == 10 and now.minute == 0:
+    try:
         if settings['daily_news_channel_id'] is None:
             return
         
-        print("Sending weekly summary...")
-        channel = bot.get_channel(settings['daily_news_channel_id'])
+        now = datetime.now(user_timezone)
+        current_time = now.strftime('%H:%M')
         
-        if channel and settings['weekly_articles']:
-            # Tag user if enabled
-            if settings['notify_user']:
-                await channel.send(f'<@{USER_ID}>**Weekly Cybersecurity Summary**')
-            else:
-                await channel.send(f'**Weekly Cybersecurity Summary**')
+        # Check if current time matches any notification time
+        if current_time in settings['notification_times']:
+            print(f"Sending daily news digest at {current_time}")
+            channel = bot.get_channel(settings['daily_news_channel_id'])
             
-            # Count articles by source
-            source_counts = {}
-            for entry in settings['weekly_articles']:
-                source = entry['article']['source']
-                source_counts[source] = source_counts.get(source, 0) + 1
+            if channel:
+                # Tag user if enabled
+                if settings['notify_user']:
+                    await channel.send(f'<@{USER_ID}> **Daily Cybersecurity News Digest**')
+                else:
+                    await channel.send(f'**Daily Cybersecurity News Digest**')
+                
+                sources = [
+                    ('Bleeping Computer', scrape_bleeping_computer, 0xFF6B6B),
+                    ('WIRED', scrape_wired_security, 0x000000),
+                    ('Ars Technica', scrape_ars_technica_security, 0xFF4F00),
+                    ('Krebs on Security', scrape_krebs_security, 0x0066CC)
+                ]
+                
+                total_articles = 0
+                
+                for source_name, scraper_func, color in sources:
+                    articles = scrape_with_retry(scraper_func)
+                    
+                    if articles:
+                        # Filter and get first new article
+                        filtered = filter_articles(articles)
+                        
+                        if filtered:
+                            article = filtered[0]
+                            embed = discord.Embed(
+                                title=article['title'],
+                                url=article['link'],
+                                description=article['description'],
+                                color=color
+                            )
+                            embed.set_footer(text=f"Source: {article['source']}")
+                            await channel.send(embed=embed)
+                            total_articles += 1
+                            
+                            # Store for weekly summary
+                            settings['weekly_articles'].append({
+                                'article': article,
+                                'timestamp': datetime.now().isoformat()
+                            })
+                        else:
+                            await channel.send(f'{source_name}: No new articles matching your filters')
+                    else:
+                        await channel.send(f'Could not fetch from {source_name}')
+                
+                save_settings(settings)
+                await channel.send(f'Daily digest complete! {total_articles} articles delivered.')
+    
+    except Exception as e:
+        print(f"Error in daily_news_digest: {e}")
+
+@tasks.loop(hours=1)
+async def weekly_summary():
+    """Send weekly summary every Sunday at 10 AM"""
+    try:
+        now = datetime.now(user_timezone)
+        
+        # Check if it's Sunday at 10:00 AM
+        if now.weekday() == 6 and now.hour == 10:
+            if settings['daily_news_channel_id'] is None:
+                return
             
-            embed = discord.Embed(
-                title="📈 This Week in Cybersecurity",
-                description=f"You received {len(settings['weekly_articles'])} articles this week",
-                color=0x5865F2
-            )
+            print("Sending weekly summary...")
+            channel = bot.get_channel(settings['daily_news_channel_id'])
             
-            for source, count in source_counts.items():
-                embed.add_field(name=source, value=f"{count} articles", inline=True)
-            
-            embed.set_footer(text="Stay informed, stay secure!")
-            await channel.send(embed=embed)
-            
-            # Clear weekly articles
-            settings['weekly_articles'] = []
-            save_settings(settings)
+            if channel and settings['weekly_articles']:
+                # Tag user if enabled
+                if settings['notify_user']:
+                    await channel.send(f'<@{USER_ID}> **Weekly Cybersecurity Summary**')
+                else:
+                    await channel.send(f'**Weekly Cybersecurity Summary**')
+                
+                # Count articles by source
+                source_counts = {}
+                for entry in settings['weekly_articles']:
+                    source = entry['article']['source']
+                    source_counts[source] = source_counts.get(source, 0) + 1
+                
+                embed = discord.Embed(
+                    title="This Week in Cybersecurity",
+                    description=f"You received {len(settings['weekly_articles'])} articles this week",
+                    color=0x5865F2
+                )
+                
+                for source, count in source_counts.items():
+                    embed.add_field(name=source, value=f"{count} articles", inline=True)
+                
+                embed.set_footer(text="Stay informed, stay secure!")
+                await channel.send(embed=embed)
+                
+                # Clear weekly articles
+                settings['weekly_articles'] = []
+                save_settings(settings)
+    
+    except Exception as e:
+        print(f"Error in weekly_summary: {e}")
 
 @bot.command(name='ping')
 async def ping(ctx):
@@ -473,6 +578,10 @@ async def help_news(ctx):
     `!news wired` - WIRED Security
     `!news ars` - Ars Technica
     `!news krebs` - Krebs on Security
+    
+    **AI Summary:**
+    `!ai_summary` - Get AI-generated summary of top 10 articles
+    `!ai_summary 15` - Summarize top 15 articles
     
     **Daily Digest:**
     `!daily_news` - Enable daily digest in this channel
@@ -502,6 +611,7 @@ async def help_news(ctx):
     • Retry on failures
     • Weekly summaries (Sundays at 10 AM)
     • Customizable notification times
+    • AI-powered summaries (Groq)
     """
     await ctx.send(help_text)
 
